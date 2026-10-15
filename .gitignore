@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+users.json
+proxies_*.json
+.env
