@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 # ============================================================
-#  DEATH — terminal stress client (ssh-friendly build)
+#  DEATH — terminal stress client (ssh-stable build)
 # ============================================================
-#  Same app. Render loop throttled so putty over ssh/ngrok
-#  doesn't drop keystrokes. Full screen only repaints when
-#  state is dirty. Animation runs on a slow tick.
+#  Fixes for putty / ssh over ngrok:
+#   - login uses absolute cursor moves, not \r tricks
+#   - terminal size read from pty directly
+#   - banner is static (no per-frame animation)
+#   - S-stop shortcut removed (use 'stop' command)
+#   - input drained before every paint
+#   - full repaint only when dirty
 # ============================================================
 
 import os
@@ -19,12 +23,10 @@ import threading
 import ssl
 import re
 import struct
-import string
-import hashlib
 import urllib.parse
 import urllib.request
 import urllib.error
-from typing import Callable, Dict, List, Optional, Set, Tuple, Any
+from typing import Callable, Dict, List, Optional, Set, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 IS_WINDOWS = (os.name == "nt")
@@ -34,8 +36,8 @@ if IS_WINDOWS:
     try:
         import ctypes
         _k32 = ctypes.windll.kernel32
-        _stdout_handle = _k32.GetStdHandle(-11)
-        _k32.SetConsoleMode(_stdout_handle, 7)
+        _h = _k32.GetStdHandle(-11)
+        _k32.SetConsoleMode(_h, 7)
     except Exception:
         pass
 
@@ -45,8 +47,6 @@ if IS_WINDOWS:
 
 ESC = "\x1b"
 RESET = f"{ESC}[0m"
-BOLD = f"{ESC}[1m"
-DIM = f"{ESC}[2m"
 CLEAR = f"{ESC}[2J{ESC}[H"
 HOME = f"{ESC}[H"
 HIDE_CURSOR = f"{ESC}[?25l"
@@ -195,6 +195,26 @@ ACCEPT_LANGS = ["en-US,en;q=0.9", "en-GB,en;q=0.8", "en-US,en;q=0.5"]
 PROXY_RE_SIMPLE = re.compile(r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}):(\d{1,5})")
 
 # ============================================================
+#  TERMINAL SIZE (fixed — reads pty directly)
+# ============================================================
+
+def term_size() -> Tuple[int, int]:
+    """Read pty size. Falls back to 80x24 which is safe for ssh."""
+    try:
+        sz = os.get_terminal_size(sys.stdout.fileno())
+        cols, rows = sz.columns, sz.lines
+        if cols < 20: cols = 80
+        if rows < 10: rows = 24
+        return cols, rows
+    except Exception:
+        pass
+    try:
+        sz = shutil.get_terminal_size((80, 24))
+        return sz.columns, sz.lines
+    except Exception:
+        return 80, 24
+
+# ============================================================
 #  USERS
 # ============================================================
 
@@ -204,9 +224,9 @@ def load_users() -> Dict[str, str]:
             data = json.load(f)
         if isinstance(data, dict):
             return data
-        return {}
     except Exception:
-        return {}
+        pass
+    return {}
 
 def save_users(users):
     try:
@@ -237,9 +257,9 @@ def load_proxies(username):
             data = json.load(f)
         if isinstance(data, dict):
             return data
-        return {}
     except Exception:
-        return {}
+        pass
+    return {}
 
 def save_proxies(username, proxies):
     try:
@@ -262,8 +282,7 @@ class State:
         self.log = []
         self.current_view = "home"
         self.input_buffer = ""
-        self.dirty = True            # force repaint when something changes
-        self.last_input_time = 0.0
+        self.dirty = True
 
         self.attacks = []
         self.online_users = ["death", "root", "admin", "guest", "ops"]
@@ -303,34 +322,27 @@ S = State()
 #  RENDER HELPERS
 # ============================================================
 
-def term_size():
-    sz = shutil.get_terminal_size((120, 40))
-    return sz.columns, sz.lines
-
 def lerp(a, b, t):
     return int(a + (b - a) * t)
 
 def clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
-def gradient_sweep(line, frame, theme, phase=0.0):
+def gradient_static(line, theme, offset=0.0):
+    """One-shot gradient — no frame-dependent animation."""
     if not line:
         return line
     ar, ag, ab = theme["accent"]
     dr, dg, db = theme["dim"]
     width = len(line)
-    period = width * 2
     out = []
     for i, ch in enumerate(line):
         if ch == " ":
             out.append(ch)
             continue
-        x = (i + frame * 3 + int(phase * width)) % period
-        if x > width:
-            x = period - x
-        t = x / max(1, width)
+        t = ((i / max(1, width)) + offset) % 1.0
         pulse = math.sin(t * math.pi)
-        pulse = clamp(int(pulse * 1000), 0, 1000) / 1000.0
+        pulse = max(0.2, pulse)
         r = lerp(dr, ar, pulse)
         g = lerp(dg, ag, pulse)
         b = lerp(db, ab, pulse)
@@ -356,19 +368,22 @@ def visible_len(s):
     return out
 
 def center_visible(s, width):
-    pad = max(0, (width - visible_len(s)) // 2)
+    vl = visible_len(s)
+    if vl >= width:
+        return s
+    pad = (width - vl) // 2
     return " " * pad + s
 
-def emblem_animated(frame, theme):
-    lines = EMBLEM.split("\n")
+def emblem_static(theme):
     ar, ag, ab = theme["accent"]
     dr, dg, db = theme["dim"]
-    out = []
+    lines = EMBLEM.split("\n")
     height = len(lines)
+    out = []
     for y, line in enumerate(lines):
-        phase = (y / max(1, height) + frame * 0.05) % 1.0
+        phase = (y / max(1, height)) % 1.0
         pulse = math.sin(phase * math.pi)
-        pulse = max(0.15, pulse)
+        pulse = max(0.2, pulse)
         r = lerp(dr, ar, pulse)
         g = lerp(dg, ag, pulse)
         b = lerp(db, ab, pulse)
@@ -416,7 +431,7 @@ def lookup_target(host):
     return info
 
 # ============================================================
-#  PROXY SOURCES
+#  PROXY SOURCES + SCRAPING (unchanged)
 # ============================================================
 
 PROXY_SOURCES = [
@@ -679,7 +694,7 @@ def scrape_and_validate(on_progress, stop):
     return alive
 
 # ============================================================
-#  ATTACK PRIMITIVES
+#  ATTACK PRIMITIVES (unchanged)
 # ============================================================
 
 def build_request(method, host, port, path="/"):
@@ -979,7 +994,7 @@ def _direct_http_burst(method, host, port, stop, stats, burst=4):
         pass
 
 # ============================================================
-#  ATTACK ORCHESTRATOR
+#  ATTACK ORCHESTRATOR (unchanged)
 # ============================================================
 
 def attack_worker(method, host, port, duration):
@@ -1073,19 +1088,27 @@ def _attack_inner(method, host, port, duration):
     time.sleep(0.6)
 
 # ============================================================
-#  RENDERERS
+#  RENDERERS (static banner, no animation over ssh)
 # ============================================================
 
-def render_banner(frame):
+def render_banner():
     theme = S.theme
     cols, _ = term_size()
     banner_lines = BANNER_DEATH.split("\n")
     banner_w = max(len(l) for l in banner_lines)
-    pad = max(0, (cols - banner_w) // 2)
+    if cols <= banner_w + 4:
+        pad = 0
+    else:
+        pad = (cols - banner_w) // 2
     out = ["\n"]
     for line in banner_lines:
-        out.append(" " * pad + gradient_sweep(line, frame, theme) + "\n")
+        out.append(" " * pad + gradient_static(line, theme) + "\n")
     return "".join(out)
+
+def render_prompt_cell():
+    _, rows = term_size()
+    theme = S.theme
+    return move(rows, 1) + clear_line()
 
 def render_prompt(frame):
     theme = S.theme
@@ -1109,10 +1132,10 @@ def render_attack_screen(frame):
     out = [HOME, CLEAR]
     header = "D E A T H   |   A T T A C K I N G"
     out.append("\n")
-    out.append(center_visible(gradient_sweep(header, frame, theme), cols) + "\n")
+    out.append(center_visible(gradient_static(header, theme), cols) + "\n")
     out.append("\n")
 
-    emblem_lines = emblem_animated(frame, theme)
+    emblem_lines = emblem_static(theme)
     emblem_w = max(len(l) for l in EMBLEM.split("\n"))
     gap = 2
 
@@ -1148,10 +1171,11 @@ def render_attack_screen(frame):
         out.append(" " * left_pad + left + " " * gap + center + center_pad + " " * gap + right + "\n")
     return "".join(out)
 
-def render_home(frame):
+def render_home():
     theme = S.theme
+    cols, _ = term_size()
     out = []
-    emblem_lines = emblem_animated(frame, theme)
+    emblem_lines = emblem_static(theme)
     emblem_w = max(len(l) for l in EMBLEM.split("\n"))
 
     method_lines = []
@@ -1160,6 +1184,16 @@ def render_home(frame):
         for name, desc in items:
             method_lines.append("  " + solid(name.ljust(8), theme, "accent") + " - " + solid(desc, theme, "dim"))
         method_lines.append("")
+
+    # if terminal too narrow, stack emblem over methods
+    if cols < emblem_w + 40:
+        out.append("\n")
+        for l in emblem_lines:
+            out.append(l + "\n")
+        out.append("\n")
+        for l in method_lines:
+            out.append(l + "\n")
+        return "".join(out)
 
     left_pad = 4
     gap = 4
@@ -1171,7 +1205,7 @@ def render_home(frame):
         out.append(" " * left_pad + left + " " * gap + right + "\n")
     return "".join(out)
 
-def render_commands(frame):
+def render_commands():
     theme = S.theme
     out = ["\n"]
     out.append("  " + solid("commands", theme, "accent") + "\n")
@@ -1181,7 +1215,7 @@ def render_commands(frame):
     out.append("\n")
     return "".join(out)
 
-def render_methods(frame):
+def render_methods():
     theme = S.theme
     out = ["\n"]
     for section, items in METHODS:
@@ -1194,7 +1228,7 @@ def render_methods(frame):
         out.append("\n")
     return "".join(out)
 
-def render_log(frame):
+def render_log():
     theme = S.theme
     out = ["\n"]
     out.append("  " + solid("session log", theme, "accent") + "\n")
@@ -1206,17 +1240,17 @@ def render_log(frame):
     out.append("\n")
     return "".join(out)
 
-def render_body(frame):
+def render_body():
     if S.current_view == "commands":
-        return render_commands(frame)
+        return render_commands()
     if S.current_view == "methods":
-        return render_methods(frame)
+        return render_methods()
     if S.current_view == "log":
-        return render_log(frame)
-    return render_home(frame)
+        return render_log()
+    return render_home()
 
 # ============================================================
-#  COMMANDS
+#  COMMANDS (S-stop removed)
 # ============================================================
 
 def cmd_help(_a): S.current_view = "commands"; S.dirty = True
@@ -1232,8 +1266,7 @@ def cmd_themes(_a):
 def cmd_theme(args):
     S.current_view = "log"
     if not args:
-        S.log_line(f"usage: theme <name>  (current: {S.theme_name})")
-        return
+        S.log_line(f"usage: theme <name>  (current: {S.theme_name})"); return
     name = args[0].lower()
     if name in THEMES:
         S.theme_name = name
@@ -1249,11 +1282,9 @@ def cmd_online(_a):
 def cmd_passwd(args):
     S.current_view = "log"
     if not args:
-        S.log_line("usage: passwd <new>")
-        return
+        S.log_line("usage: passwd <new>"); return
     if S.is_admin:
-        S.log_line("admin password cannot be changed")
-        return
+        S.log_line("admin password cannot be changed"); return
     S.users[S.username] = args[0]
     save_users(S.users)
     S.log_line("password updated")
@@ -1268,24 +1299,21 @@ def cmd_plan(_a):
 def cmd_queue(_a):
     S.current_view = "log"
     if not S.queue:
-        S.log_line("queue empty")
-        return
+        S.log_line("queue empty"); return
     for q in S.queue:
         S.log_line(f"  {q['target']}  {q['method']}  {q['duration']}s")
 
 def cmd_scheduled(_a):
     S.current_view = "log"
     if not S.scheduled:
-        S.log_line("no scheduled attacks")
-        return
+        S.log_line("no scheduled attacks"); return
     for a in S.scheduled:
         S.log_line(f"  {a['when']}  {a['target']}  {a['method']}")
 
 def cmd_ongoing(_a):
     S.current_view = "log"
     if not S.attacks:
-        S.log_line("no running attacks")
-        return
+        S.log_line("no running attacks"); return
     for a in S.attacks:
         S.log_line(f"  {a['target']}  {a['method']}  {a['elapsed']}s  {a['pps']} pps")
 
@@ -1330,7 +1358,7 @@ def cmd_users(_a):
 def cmd_scrape(_a):
     S.current_view = "log"
     if S.scraping:
-        S.log_line("scrape already running — press S to stop & save"); return
+        S.log_line("scrape already running — use 'stop' or ctrl-c to abort"); return
     S.scraping = True
     S.scrape_stop.clear()
 
@@ -1423,8 +1451,12 @@ def cmd_status(_a):
 
 def cmd_stop(_a):
     S.current_view = "log"
+    if S.scraping:
+        S.scrape_stop.set()
+        S.log_line("stopping scrape...")
+        return
     if S.attack_screen is None:
-        S.log_line("no attack running"); return
+        S.log_line("nothing to stop"); return
     S.attack_stop.set()
     S.log_line("stopping attack...")
 
@@ -1526,7 +1558,7 @@ def dispatch(line):
     handler(args)
 
 # ============================================================
-#  INPUT
+#  INPUT — S-stop removed
 # ============================================================
 
 if IS_WINDOWS:
@@ -1542,19 +1574,27 @@ if IS_WINDOWS:
 else:
     import select as _select
     def read_key():
-        dr, _, _ = _select.select([sys.stdin], [], [], 0)
-        if not dr:
+        try:
+            dr, _, _ = _select.select([sys.stdin], [], [], 0)
+            if not dr:
+                return None
+            return sys.stdin.read(1)
+        except Exception:
             return None
-        return sys.stdin.read(1)
 
 def handle_key(ch):
     if ch is None:
         return
-    if ch in ("S", "s") and S.scraping and not S.input_buffer:
-        S.scrape_stop.set()
-        S.log_line("S pressed — stopping scrape, saving what we have...")
-        return
-    if ch == "\x03":
+    if ch == "\x03":                # ctrl-c
+        # ctrl-c stops scrape or attack instead of killing the app
+        if S.scraping:
+            S.scrape_stop.set()
+            S.log_line("ctrl-c — stopping scrape...")
+            return
+        if S.attack_screen is not None:
+            S.attack_stop.set()
+            S.log_line("ctrl-c — stopping attack...")
+            return
         S.running = False
         return
     if ch in ("\r", "\n"):
@@ -1569,67 +1609,81 @@ def handle_key(ch):
         return
     if ch == "\x1b":
         return
+    if ch == "\x04":                # ctrl-d = exit
+        S.running = False
+        return
     if ch.isprintable():
         S.input_buffer += ch
         S.dirty = True
 
 # ============================================================
-#  LOGIN
+#  LOGIN — absolute cursor moves, no \r tricks
 # ============================================================
 
-def login_screen():
-    theme = S.theme
-    sys.stdout.write(CLEAR)
-    sys.stdout.write(render_banner(0))
-    sys.stdout.write("\n\n")
+def prompt_input(row: int, label: str, mask: bool) -> str:
+    """Read a line of input with proper absolute-position rendering.
+    Uses move(row,1) + clear_line() to redraw only that row each keystroke."""
     cols, _ = term_size()
+    theme = S.theme
+    buf = ""
 
-    def center(t):
-        return center_visible(t, cols)
+    def draw():
+        shown = "•" * len(buf) if mask else buf
+        # truncate if wider than terminal
+        maxw = max(1, cols - len(label) - 2)
+        if len(shown) > maxw:
+            shown = shown[-maxw:]
+        line = solid(label, theme, "dim") + solid(shown, theme, "accent")
+        sys.stdout.write(move(row, 1) + clear_line() + line)
+        sys.stdout.flush()
 
-    sys.stdout.write(center(solid("login", theme, "accent")) + "\n\n")
-    sys.stdout.write(center(solid("username: ", theme, "dim")))
-    sys.stdout.flush()
-
-    username = ""
+    draw()
     while True:
         ch = read_key()
         if ch is None:
             time.sleep(0.02)
             continue
         if ch == "\x03":
-            return False
+            return None
         if ch in ("\r", "\n"):
-            break
+            return buf
         if ch in ("\x7f", "\b"):
-            username = username[:-1]
-        elif ch.isprintable():
-            username += ch
-        sys.stdout.write("\r" + " " * cols + "\r")
-        sys.stdout.write(center(solid("username: ", theme, "dim") + solid(username, theme, "accent")))
-        sys.stdout.flush()
+            buf = buf[:-1]
+            draw()
+            continue
+        if ch == "\x1b":
+            continue
+        if ch.isprintable():
+            buf += ch
+            draw()
 
-    sys.stdout.write("\n" + center(solid("password: ", theme, "dim")))
+def login_screen() -> bool:
+    theme = S.theme
+    cols, rows = term_size()
+
+    # draw banner once, centered, at the top
+    sys.stdout.write(CLEAR + HOME)
+    banner = render_banner()
+    # find where the banner ends (rows used)
+    banner_rows = banner.count("\n")
+    sys.stdout.write(banner)
     sys.stdout.flush()
 
-    password = ""
-    while True:
-        ch = read_key()
-        if ch is None:
-            time.sleep(0.02)
-            continue
-        if ch == "\x03":
-            return False
-        if ch in ("\r", "\n"):
-            break
-        if ch in ("\x7f", "\b"):
-            password = password[:-1]
-        elif ch.isprintable():
-            password += ch
-        masked = "•" * len(password)
-        sys.stdout.write("\r" + " " * cols + "\r")
-        sys.stdout.write(center(solid("password: ", theme, "dim") + solid(masked, theme, "accent")))
-        sys.stdout.flush()
+    # put "login" title under the banner
+    title_row = banner_rows + 2
+    sys.stdout.write(move(title_row, 1) + clear_line()
+                     + center_visible(solid("login", theme, "accent"), cols))
+    sys.stdout.flush()
+
+    user_row = title_row + 2
+    pass_row = user_row + 1
+
+    username = prompt_input(user_row, "username: ", mask=False)
+    if username is None:
+        return False
+    password = prompt_input(pass_row, "password: ", mask=True)
+    if password is None:
+        return False
 
     ok, is_admin = verify_user(username, password)
     if ok:
@@ -1637,18 +1691,19 @@ def login_screen():
         S.is_admin = is_admin
         return True
 
-    sys.stdout.write("\n\n" + center(solid("access denied", theme, "accent")) + "\n")
+    sys.stdout.write(move(pass_row + 2, 1) + clear_line()
+                     + center_visible(solid("access denied", theme, "accent"), cols))
     sys.stdout.flush()
     time.sleep(1.5)
     return login_screen()
 
 # ============================================================
-#  MAIN LOOP — throttled for ssh
+#  MAIN LOOP
 # ============================================================
 
-FRAME_INTERVAL = 1.0 / 8.0       # main ui: 8 fps
-ATTACK_INTERVAL = 1.0 / 10.0     # attack screen: 10 fps
-BLINK_INTERVAL = 1.0 / 2.0       # prompt blink: 2 hz
+FRAME_INTERVAL = 1.0 / 8.0
+ATTACK_INTERVAL = 1.0 / 8.0
+BLINK_INTERVAL = 1.0 / 2.0
 
 def main():
     if not login_screen():
@@ -1656,7 +1711,8 @@ def main():
 
     S.proxies = load_proxies(S.username)
 
-    sys.stdout.write(HIDE_CURSOR + CLEAR)
+    # clean transition into the app
+    sys.stdout.write(HIDE_CURSOR + CLEAR + HOME)
     sys.stdout.flush()
 
     last_size = term_size()
@@ -1664,25 +1720,25 @@ def main():
     last_blink = 0.0
     blink_on = True
     last_view = None
-    last_buf = None
+
+    # force first paint
+    S.dirty = True
 
     try:
         while S.running:
             now = time.time()
 
-            # --- drain input first (so keystrokes never wait on paint) ---
+            # drain input first — keystrokes never wait on a paint
             ch = read_key()
             while ch is not None:
                 handle_key(ch)
                 ch = read_key()
 
-            # --- resize check ---
             cur_size = term_size()
             if cur_size != last_size:
                 last_size = cur_size
                 S.dirty = True
 
-            # --- attack screen path ---
             if S.attack_screen is not None:
                 if now - last_render >= ATTACK_INTERVAL:
                     buf = render_attack_screen(S.attack_frame)
@@ -1697,11 +1753,10 @@ def main():
                     S.attack_screen = None
                     S.current_view = "home"
                     S.dirty = True
-                    last_buf = None
                 time.sleep(0.02)
                 continue
 
-            # --- prompt blink (separate from full repaint) ---
+            # prompt-only blink (moves cursor, does not repaint screen)
             if now - last_blink >= BLINK_INTERVAL:
                 blink_on = not blink_on
                 last_blink = now
@@ -1716,16 +1771,24 @@ def main():
                 sys.stdout.write(move(rows, 1) + clear_line() + line)
                 sys.stdout.flush()
 
-            # --- full repaint only when dirty or view changed or fps tick ---
+            # full repaint only when state changed
             view_changed = S.current_view != last_view
             if S.dirty or view_changed:
                 buf = [HOME, CLEAR]
-                buf.append(render_banner(S.frame))
-                buf.append(render_body(S.frame))
-                buf.append(render_prompt(S.frame))
+                buf.append(render_banner())
+                buf.append(render_body())
+                # prompt at bottom
+                _, rows = term_size()
+                theme = S.theme
+                user = solid(S.username or "guest", theme, "accent")
+                sep = solid("●", theme, "accent")
+                brand = solid("death", theme, "accent")
+                arrow = solid("►", theme, "accent")
+                cur = solid("█", theme, "accent") if blink_on else " "
+                buf.append(move(rows, 1) + clear_line()
+                           + f"{user}{sep}{brand}{arrow} {S.input_buffer}{cur}")
                 sys.stdout.write("".join(buf))
                 sys.stdout.flush()
-                last_buf = None
                 S.dirty = False
                 last_view = S.current_view
                 S.frame += 1
